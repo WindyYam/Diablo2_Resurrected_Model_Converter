@@ -42,6 +42,8 @@ Verified: decoded positions reproduce Mesh.ExtendedData.bbMin/bbMax to 4 decimal
 * **CRC** = CRC32 of the file from the start of the section table (0x68) to the end. Reproduces the stored value on the original.
 * **Array reference** = u32 count + 64-bit pointer (12 bytes, no padding); the pointer is a relocation entry, count at `src-4`.
 * **TriTopology** = Groups(12) | Indices(12) | Indices16(12) | ...; Groups entry = {MaterialIndex, TriFirst, TriCount} (3 x u32).
+  The writer locates `Indices16` through its relocation and matching group-array contents, then uses topology-array order
+  to disambiguate duplicate data. Bounding-box fields are patched by reflected field offsets, not ambiguous value searches.
 * **Mixed-marshalling entry** (16 B) = {count, offsetInSection, typeSection, typeOffset}; for meshes it is the vertex array
   (count + start offset), so its count must follow the vertex count.
 * **first16bit / first8bit** section markers = start of the 16-bit / 8-bit data regions. The three Indices16 arrays are packed

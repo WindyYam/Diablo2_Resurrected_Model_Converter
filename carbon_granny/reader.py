@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import struct
 from typing import Any
@@ -63,6 +63,7 @@ class RawGr2:
     version: int
     section_count: int
     file_info: dict[str, Any]
+    field_offsets: dict[int, dict[str, int]] = field(default_factory=dict)
 
     @property
     def secCount(self) -> int:  # compatibility with the JavaScript contract
@@ -370,6 +371,7 @@ def read_raw(source: Any) -> RawGr2:
         }
 
     object_cache: dict[tuple[int, int], dict[str, Any]] = {}
+    field_offsets: dict[int, dict[str, int]] = {}
     depth = 0
 
     def read_object(type_offset: int, object_offset: int):
@@ -386,6 +388,8 @@ def read_raw(source: Any) -> RawGr2:
 
         result: dict[str, Any] = {}
         object_cache[key] = result
+        object_fields: dict[str, int] = {}
+        field_offsets[id(result)] = object_fields
         members, offsets = type_layout(type_offset)
         for member, relative_offset in zip(members, offsets):
             field = object_offset + relative_offset
@@ -395,6 +399,7 @@ def read_raw(source: Any) -> RawGr2:
                 while f"{name}\0{suffix}" in result:
                     suffix += 1
                 name = f"{name}\0{suffix}"
+            object_fields[name] = field
             member_type = member["type"]
 
             if member_type == MEMBER_TYPES["String"]:
@@ -464,7 +469,7 @@ def read_raw(source: Any) -> RawGr2:
     root_type_global = section_bases[root_type_section] + root_type_offset
     root_object_global = section_bases[root_object_section] + root_object_offset
     file_info = read_object(root_type_global, root_object_global)
-    return RawGr2(version, section_count, file_info)
+    return RawGr2(version, section_count, file_info, field_offsets)
 
 
 __all__ = [

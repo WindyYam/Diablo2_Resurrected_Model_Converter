@@ -48,6 +48,68 @@ EXPECTED_LAYOUT = [(17, "Position", 4), (14, "BoneWeights", 4), (12, "BoneIndice
                    (13, "Normal", 4), (13, "Tangent", 4), (21, "TextureCoordinates0", 2)]
 
 
+def _index_array_candidates(raw, rel_src, relocs, indices, groups):
+    """Find topology-referenced arrays whose contents match the reflected topology."""
+    if not len(indices):
+        return []
+    pattern = indices.tobytes()
+    u32 = lambda off: struct.unpack_from("<I", raw, off)[0]
+    matches = []
+    for src, target_section, target in relocs:
+        if target_section != 0 or src < 28 or src + 8 > len(raw) or target + len(pattern) > len(raw):
+            continue
+        if u32(src - 4) != len(indices) or raw[target:target + len(pattern)] != pattern:
+            continue
+        group_ref = rel_src.get(src - 24)
+        if group_ref is None or group_ref[1] != 0 or u32(src - 28) != len(groups):
+            continue
+        group_target = group_ref[2]
+        group_size = 12 * len(groups)
+        if group_target + group_size > len(raw):
+            continue
+        expected_groups = b"".join(
+            struct.pack("<III", group["MaterialIndex"], group["TriFirst"], group["TriCount"])
+            for group in groups
+        )
+        if raw[group_target:group_target + group_size] == expected_groups:
+            matches.append((target, src))
+    return matches
+
+
+def _topology_array_locations(topologies, candidate_lists):
+    """Disambiguate duplicate topology data using the contiguous reflected topology array."""
+    hypotheses = set()
+    for i, left in enumerate(candidate_lists):
+        for j in range(i + 1, len(candidate_lists)):
+            right = candidate_lists[j]
+            for left_candidate in left:
+                for right_candidate in right:
+                    delta = right_candidate[1] - left_candidate[1]
+                    if delta > 0 and delta % (j - i) == 0:
+                        stride = delta // (j - i)
+                        hypotheses.add((stride, left_candidate[1] - i * stride))
+
+    scored = []
+    for stride, start in hypotheses:
+        locations = {}
+        for i, candidates in enumerate(candidate_lists):
+            expected = start + i * stride
+            matching = [candidate for candidate in candidates if candidate[1] == expected]
+            if matching:
+                locations[i] = matching
+        scored.append((len(locations), locations))
+    if not scored:
+        return {}
+    best = max(score for score, _ in scored)
+    winners = [locations for score, locations in scored if score == best]
+    resolved = {}
+    for i in range(len(topologies)):
+        matches = {candidate for locations in winners for candidate in locations.get(i, [])}
+        if len(matches) == 1 and all(i in locations for locations in winners):
+            resolved[i] = matches.pop()
+    return resolved
+
+
 # =====================================================================================
 #  Container
 # =====================================================================================
@@ -253,7 +315,9 @@ class D2RModel:
         self.path = path
         self.raw = open(path, "rb").read()
         self.g2 = Gr2.load(self.raw)
-        self.fi = read_raw(self.raw).file_info
+        parsed = read_raw(self.raw)
+        self.fi = parsed.file_info
+        self.field_offsets = parsed.field_offsets
         sk = self.fi["Skeletons"][0]["Bones"]
         self.bones = sk
         self.n2b = {b["Name"]: i for i, b in enumerate(sk)}
@@ -273,6 +337,16 @@ class D2RModel:
         for r in s0.relocs:
             rel_dst.setdefault((r[1], r[2]), []).append(r[0])
         u32 = lambda o: struct.unpack_from("<I", raw0, o)[0]
+        topologies = self.fi["TriTopologies"]
+        topology_candidates = [
+            _index_array_candidates(
+                raw0, rel_src, s0.relocs,
+                np.array([list(x.values())[0] & 0xFFFF for x in topo["Indices16"]], "<u2"),
+                topo["Groups"],
+            )
+            for topo in topologies
+        ]
+        topology_locations = _topology_array_locations(topologies, topology_candidates)
         used_mixed, used_idx = set(), set()
         self.loc = []
         for mi, m in enumerate(self.meshes):
@@ -304,23 +378,25 @@ class D2RModel:
                           "PolygonIndices", "TriAnnotationSets"):
                 if len(topo[extra]):
                     raise ValueError(f"mesh {m['Name']}: topology has non-empty '{extra}' (unsupported)")
-            pat = ind.tobytes()
-            pos = raw0.find(pat)
-            if pos < 0 or raw0.find(pat, pos + 2) >= 0:
-                raise ValueError(f"mesh {m['Name']}: index array not found uniquely")
+            topo_index = next((i for i, item in enumerate(topologies) if item is topo), None)
+            candidates = (topology_candidates[topo_index] if topo_index is not None else
+                          _index_array_candidates(raw0, rel_src, s0.relocs, ind, topo["Groups"]))
+            selected = topology_locations.get(topo_index) if topo_index is not None else None
+            if selected is None:
+                if len(candidates) != 1:
+                    raise ValueError(f"mesh {m['Name']}: index array reference not found uniquely")
+                selected = candidates[0]
+            pos, s16_src = selected
             if pos in used_idx:
                 raise ValueError("two meshes share one index buffer (unsupported)")
             used_idx.add(pos)
             L["idx"], L["nidx"] = pos, len(ind)
-            s16 = [s for s in rel_dst.get((0, pos), []) if u32(s - 4) == len(ind)]
-            if len(s16) != 1:
-                raise ValueError(f"mesh {m['Name']}: index array reference not found")
-            L["idx_cnt"] = s16[0] - 4
-            g = rel_src.get(s16[0] - 24)
+            L["idx_cnt"] = s16_src - 4
+            g = rel_src.get(s16_src - 24)
             ngrp = len(topo["Groups"])
-            if g is None or u32(s16[0] - 28) != ngrp:
+            if g is None or u32(s16_src - 28) != ngrp:
                 raise ValueError(f"mesh {m['Name']}: material-group array not found")
-            L["grp"], L["grp_cnt"], L["ngrp"] = g[2], s16[0] - 28, ngrp
+            L["grp"], L["grp_cnt"], L["ngrp"] = g[2], s16_src - 28, ngrp
             for gi, gr in enumerate(topo["Groups"]):
                 if struct.unpack_from("<III", raw0, g[2] + 12 * gi) != \
                         (gr["MaterialIndex"], gr["TriFirst"], gr["TriCount"]):
@@ -328,10 +404,18 @@ class D2RModel:
             # bounds + scale
             ext = m["ExtendedData"]
             bbp = struct.pack("<6f", *ext["bbMin"], *ext["bbMax"])
-            bb = raw0.find(bbp)
-            L["bb"] = bb if bb >= 0 and raw0.find(bbp, bb + 1) < 0 else None
+            ext_offsets = self.field_offsets.get(id(ext), {})
+            bb_min = ext_offsets.get("bbMin")
+            bb_max = ext_offsets.get("bbMax")
+            if (bb_min is not None and bb_max == bb_min + 12 and bb_min + 24 <= len(raw0)
+                    and raw0[bb_min:bb_min + 24] == bbp):
+                L["bb"] = bb_min
+            else:
+                bb = raw0.find(bbp)
+                L["bb"] = bb if bb >= 0 and raw0.find(bbp, bb + 1) < 0 else None
             L["vscale"] = None
-            if L["bb"] is not None:
+            bb = L["bb"]
+            if bb is not None:
                 sp = struct.pack("<f", ext["VertexScale"])
                 after = raw0.find(sp, bb + 24, bb + 24 + 96)
                 before = raw0.rfind(sp, max(0, bb - 64), bb)
