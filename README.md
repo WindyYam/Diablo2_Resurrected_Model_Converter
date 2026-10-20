@@ -2,6 +2,14 @@
 
 Python utilities to convert Diablo II: Resurrected models to GLB for Blender editing, write edited geometry back to a model, and convert textures to or from DDS.
 
+## GUI
+
+Launch the graphical interface:
+
+```powershell
+py d2r_model_tool_gui.py
+```
+
 ## Model Usage
 
 Convert a D2R model to GLB:

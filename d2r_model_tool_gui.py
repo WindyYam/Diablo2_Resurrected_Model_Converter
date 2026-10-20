@@ -66,7 +66,7 @@ class ModelToolGUI(tk.Tk):
         self.model_export_meters = tk.BooleanVar()
         self._path_row(tab, "Input model", self.model_in, 0, "open", [("D2R model", "*.model"), ("All files", "*.*")])
         self._path_row(tab, "Output GLB", self.model_glb_out, 1, "save", [("glTF Binary", "*.glb")])
-        self.model_in.trace_add("write", self._default_output(self.model_glb_out, ".glb"))
+        self.model_in.trace_add("write", self._default_output(self.model_in, self.model_glb_out, ".glb"))
         ttk.Checkbutton(tab, text="Convert units to meters", variable=self.model_export_meters).grid(
             row=2, column=1, sticky="w", pady=(8, 4))
         self._add_run_button(tab, "Convert to GLB", self._model_export_command, row=3)
@@ -84,7 +84,7 @@ class ModelToolGUI(tk.Tk):
         self._path_row(tab, "Edited GLB", self.glb_in, 0, "open", [("glTF Binary", "*.glb"), ("All files", "*.*")])
         self._path_row(tab, "Original model template", self.template_model, 1, "open", [("D2R model", "*.model"), ("All files", "*.*")])
         self._path_row(tab, "Output model", self.model_out, 2, "save", [("D2R model", "*.model")])
-        self.template_model.trace_add("write", self._default_output(self.model_out, "_edited.model"))
+        self.template_model.trace_add("write", self._default_output(self.template_model, self.model_out, "_edited.model"))
 
         ttk.Label(tab, text="Meshes (optional)").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=6)
         ttk.Entry(tab, textvariable=self.mesh_filter).grid(row=3, column=1, sticky="ew", pady=6)
@@ -116,9 +116,11 @@ class ModelToolGUI(tk.Tk):
         self.texture_format = tk.StringVar(value="Auto")
         self.texture_fmt_word = tk.StringVar()
         self.texture_dx10 = tk.BooleanVar()
+        self.texture_in.trace_add("write", self._texture_output_default)
         self._render_texture_fields()
 
     def _render_texture_fields(self, _event=None):
+        self.run_buttons = [button for button in self.run_buttons if button.master is not self.texture_fields]
         for child in self.texture_fields.winfo_children():
             child.destroy()
         action = self.texture_action.get()
@@ -129,7 +131,6 @@ class ModelToolGUI(tk.Tk):
             self._path_row(self.texture_fields, "Input texture", self.texture_in, 0, "open",
                            [("D2R texture", "*.texture"), ("All files", "*.*")])
             self._path_row(self.texture_fields, "Output DDS", self.texture_out, 1, "save", [("DDS image", "*.dds")])
-            self.texture_in.trace_add("write", self._default_output(self.texture_out, ".dds"))
             ttk.Label(self.texture_fields, text="Format").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
             ttk.Combobox(self.texture_fields, textvariable=self.texture_format, state="readonly",
                          values=("Auto", *TEXTURE_FORMATS)).grid(row=2, column=1, sticky="ew", pady=6)
@@ -140,7 +141,6 @@ class ModelToolGUI(tk.Tk):
                            [("DDS image", "*.dds"), ("All files", "*.*")])
             self._path_row(self.texture_fields, "Output texture", self.texture_out, 1, "save",
                            [("D2R texture", "*.texture")])
-            self.texture_in.trace_add("write", self._default_output(self.texture_out, ".texture"))
             self._path_row(self.texture_fields, "Original template (optional)", self.texture_template, 2, "open",
                            [("D2R texture", "*.texture"), ("All files", "*.*")])
             ttk.Label(self.texture_fields, text="Format word (optional)").grid(
@@ -152,18 +152,34 @@ class ModelToolGUI(tk.Tk):
         self.texture_fields.columnconfigure(1, weight=1)
         self._add_run_button(self.texture_fields, "Run texture action", self._texture_command,
                              row=len(self.texture_fields.winfo_children()) + 1)
+        self._texture_output_default()
 
     @staticmethod
-    def _default_output(output_var, extension):
+    def _default_output(source_var, output_var, suffix):
+        last_suggested = ""
+
         def update(*_args):
+            nonlocal last_suggested
             current = output_var.get()
-            if not current:
-                return
-            if extension == ".glb":
-                source = None
-            else:
-                source = None
+            source = source_var.get().strip()
+            if source and (not current or current == last_suggested):
+                base = os.path.splitext(source)[0]
+                suggested = base + suffix if suffix.startswith("_") else base + suffix
+                output_var.set(suggested)
+                last_suggested = suggested
         return update
+
+    def _texture_output_default(self, *_args):
+        source = self.texture_in.get().strip()
+        output = self.texture_out.get()
+        if not source:
+            return
+        suffix = ".dds" if self.texture_action.get() == "Texture to DDS" else ".texture"
+        suggested = os.path.splitext(source)[0] + suffix
+        previous = getattr(self, "_texture_suggested_output", "")
+        if not output or output == previous:
+            self.texture_out.set(suggested)
+            self._texture_suggested_output = suggested
 
     def _add_run_button(self, parent, label, command_builder, row):
         button = ttk.Button(parent, text=label, command=lambda: self._run(command_builder))
