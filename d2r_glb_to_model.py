@@ -18,13 +18,14 @@ Workflow
 
 Matching rules
     * a GLB mesh node is matched to an original mesh by node name or mesh name (Blender's ".001"
-      suffixes are ignored); meshes that are not in the GLB are left exactly as they were
+      suffixes are ignored); template meshes missing from the GLB get an invisible placeholder
     * a mesh may have as many glTF primitives as the original has material groups (1 each here)
     * skin joints are matched to skeleton bones by node NAME; influences on bones that are not
       bound to the mesh are moved to the nearest bound ancestor bone, max 4 influences / vertex
 Conventions converted for you: V flipped (Maya V-up <-> glTF V-down), tangent handedness,
 units (--meters), skinned-mesh node transform ignored (glTF spec).
 """
+import itertools
 import json
 import os
 import re
@@ -111,6 +112,45 @@ def smooth_normals(P, tris):
     for k in range(3):
         np.add.at(N, tris[:, k], f)
     return N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+
+
+def placeholder_meshdata(mdl, mi, used_indices):
+    m = mdl.meshes[mi]
+    groups = m["PrimaryTopology"]["Groups"]
+    if not groups:
+        raise ValueError(f"'{m['Name']}' has no material groups for an empty placeholder")
+    if not m["BoneBindings"]:
+        raise ValueError(f"'{m['Name']}' has no bone bindings for an empty placeholder")
+
+    pattern = None
+    for vertex_count in range(3, 33):
+        for tri in itertools.permutations(range(vertex_count), 3):
+            candidate = struct.pack("<3H", *tri)
+            if candidate not in used_indices and mdl.raw0.find(candidate) < 0:
+                pattern = candidate
+                used_indices.add(candidate)
+                indices = tri
+                break
+        if pattern is not None:
+            break
+    if pattern is None:
+        raise ValueError(f"could not find unique placeholder indices for '{m['Name']}'")
+
+    vertex_count = max(indices) + 1
+    center = (np.array(m["ExtendedData"]["bbMin"], dtype=np.float64) +
+              np.array(m["ExtendedData"]["bbMax"], dtype=np.float64)) / 2
+    P = np.tile(center, (vertex_count, 1))
+    N = np.tile([0.0, 1.0, 0.0], (vertex_count, 1))
+    T = np.tile([1.0, 0.0, 0.0, 1.0], (vertex_count, 1))
+    UV = np.zeros((vertex_count, 2))
+    bone = mdl.n2b[m["BoneBindings"][0]["BoneName"]]
+    J = np.zeros((vertex_count, 4), dtype=np.int64)
+    J[:, 0] = bone
+    W = np.zeros((vertex_count, 4))
+    W[:, 0] = 1.0
+    tri = np.array([indices], dtype=np.int64)
+    return MeshData(m["Name"], P, N, T, UV, J, W,
+                    [tri] + [np.zeros((0, 3), dtype=np.int64) for _ in groups[1:]])
 
 
 # --------------------------------------------------------------------- GLB -> MeshData
@@ -246,8 +286,22 @@ def convert(glb, template, out, meters=False, only=None, keep_node_transform=Fal
         edits[mi] = e
     if not edits:
         raise ValueError("no mesh in the GLB matched a mesh of the template model")
+    used_indices = set()
+    placeholders = set()
+    for mi, m in enumerate(mdl.meshes):
+        if mi in edits or (only and m["Name"] not in only):
+            continue
+        log(f"  missing from GLB: {m['Name']}; creating an invisible placeholder")
+        edits[mi] = placeholder_meshdata(mdl, mi, used_indices)
+        placeholders.add(mi)
+    untouched = [m["Name"] for mi, m in enumerate(mdl.meshes)
+                 if mi not in edits and only and m["Name"] not in only]
+    if untouched:
+        log(f"  left unchanged by --only: {untouched}")
     # ---- unit sanity check: a missing/extra --meters (or Blender unit scale) changes size by ~3.28x
     for mi, e in edits.items():
+        if mi in placeholders:
+            continue
         ext = mdl.meshes[mi]["ExtendedData"]
         orig = float(np.linalg.norm(np.array(ext["bbMax"]) - np.array(ext["bbMin"])))
         new = float(np.linalg.norm(e.P.max(0) - e.P.min(0)))
@@ -260,9 +314,6 @@ def convert(glb, template, out, meters=False, only=None, keep_node_transform=Fal
                 hint = " This looks like the GLB was exported WITH --meters but you did not pass --meters."
             raise ValueError(f"'{mdl.meshes[mi]['Name']}' would be {r:.2f}x the size of the original mesh "
                              f"(diagonal {new:.3f} vs {orig:.3f}).{hint} Use --force if this is intentional.")
-    untouched = [m["Name"] for i, m in enumerate(mdl.meshes) if i not in edits]
-    if untouched:
-        log(f"  left unchanged: {untouched}")
     g2 = mdl.apply(edits, log=log)
     size = g2.save(out)
     # ---- verify what we wrote by re-reading it with the independent reader
